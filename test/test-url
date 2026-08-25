@@ -1,0 +1,79 @@
+#!/bin/bash
+
+# URL allowlist, LAN insecure default, and curl-config safety — no network.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+
+# shellcheck source=../unifi-air-common.sh
+source "$PLUGIN_DIR/unifi-air-common.sh" || exit 1
+
+passed=0
+failed=0
+ok()   { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+fail() { printf '  FAIL  %s\n        %s\n' "$1" "$2"; failed=$(( failed + 1 )); }
+
+expect_url() { # input expected desc
+  local got
+  got=$(unifi_air_normalize_url "$1") || { fail "$3" "rejected '$1'"; return; }
+  if [[ $got == "$2" ]]; then ok "$3"
+  else fail "$3" "got '$got' expected '$2'"; fi
+}
+
+reject_url() { # input desc
+  local got
+  got=$(unifi_air_normalize_url "$1") && fail "$2" "accepted as '$got'" || ok "$2"
+}
+
+echo "unifi_air_normalize_url"
+
+expect_url "https://192.168.1.1" "https://192.168.1.1" "https IPv4 origin"
+expect_url "192.168.1.1" "https://192.168.1.1" "bare host becomes https"
+expect_url "https://192.168.1.1/" "https://192.168.1.1" "strips trailing slash"
+expect_url "https://192.168.1.1/proxy/protect" "https://192.168.1.1" "strips a path"
+expect_url "http://127.0.0.1:8443" "http://127.0.0.1:8443" "keeps http and port"
+expect_url "https://unifi.local" "https://unifi.local" "LAN hostname"
+expect_url "  https://udm.example  " "https://udm.example" "trims whitespace"
+
+reject_url $'https://x.example/"\noutput = "/tmp/pwned' "rejects a quote/newline injection"
+reject_url "https://user:pass@192.168.1.1" "rejects userinfo"
+reject_url "https://192.168.1.1?next=1" "rejects a query string"
+reject_url "https://192.168.1.1#frag" "rejects a fragment"
+reject_url "ftp://192.168.1.1" "rejects a non-http scheme"
+reject_url "https://192.168.1.1:99999" "rejects an out-of-range port"
+reject_url "" "rejects empty"
+
+echo
+echo "unifi_air_config_safe"
+
+if unifi_air_config_safe "https://192.168.1.1" "abc"; then ok "plain tokens are safe"
+else fail "plain tokens are safe" "rejected"; fi
+if unifi_air_config_safe $'https://x\noutput = "/tmp/x"'; then
+  fail "newline is unsafe" "accepted"
+else ok "newline is unsafe"; fi
+if unifi_air_config_safe 'key"header = "X: 1'; then
+  fail "quote is unsafe" "accepted"
+else ok "quote is unsafe"; fi
+
+echo
+echo "unifi_air_host_is_lan"
+
+if unifi_air_host_is_lan "192.168.1.1"; then ok "192.168/16 is LAN"; else fail "192.168/16 is LAN" ""; fi
+if unifi_air_host_is_lan "10.0.0.1"; then ok "10/8 is LAN"; else fail "10/8 is LAN" ""; fi
+if unifi_air_host_is_lan "172.16.0.1"; then ok "172.16/12 is LAN"; else fail "172.16/12 is LAN" ""; fi
+if unifi_air_host_is_lan "127.0.0.1"; then ok "loopback is LAN"; else fail "loopback is LAN" ""; fi
+if unifi_air_host_is_lan "unifi.local"; then ok ".local is LAN"; else fail ".local is LAN" ""; fi
+if unifi_air_host_is_lan "unifi.example.com"; then
+  fail "public hostname is not LAN" "treated as LAN"
+else ok "public hostname is not LAN"; fi
+if unifi_air_host_is_lan "8.8.8.8"; then
+  fail "public IPv4 is not LAN" "treated as LAN"
+else ok "public IPv4 is not LAN"; fi
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))

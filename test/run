@@ -1,1 +1,19 @@
-placeholder
+#!/bin/bash
+# Run the UniFi Air plugin test suite.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+
+status=0
+for t in test-manifest test-url test-extract test-fetch lint; do
+  echo "== $t =="
+  if "$TEST_DIR/$t"; then
+    echo
+  else
+    status=1
+    echo
+  fi
+done
+exit "$status"
