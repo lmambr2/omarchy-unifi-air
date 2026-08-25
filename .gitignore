@@ -1,3 +1,11 @@
 *~
 *.bak
 .DS_Store
+
+# Runtime leftovers. Credentials live in the keyring; URL/TLS in
+# ~/.local/state/omarchy/unifi-air/ — never copy those into the plugin folder.
+cookie
+config
+auth.*
+body.*
+err.*
