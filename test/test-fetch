@@ -1,0 +1,283 @@
+#!/bin/bash
+
+# Run unifi-air-fetch against a stub Protect console. No real credentials
+# and no network beyond the loopback. A shim curl logs argv so a secret
+# that slipped onto the command line fails the test.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+
+for cmd in python3 curl jq; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is required" >&2; exit 1; }
+done
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"; [[ -n ${stub_pid:-} ]] && kill "$stub_pid" 2>/dev/null' EXIT
+
+mkdir -p "$work/bin"
+cat >"$work/bin/secret-tool" <<'SHIM'
+#!/bin/sh
+type=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = type ] && type="$a"
+  prev="$a"
+done
+case "$1" in
+  lookup)
+    if [ "$type" = api-key ] && [ "${STUB_HAVE_KEY:-}" = 1 ]; then printf 'test-key'; fi
+    if [ "$type" = password ] && [ "${STUB_HAVE_PASS:-}" = 1 ]; then printf 'test-password'; fi
+    ;;
+  store) cat >/dev/null ;;
+  clear) exit 0 ;;
+esac
+SHIM
+cat >"$work/bin/curl" <<'SHIM'
+#!/bin/bash
+{
+  printf 'ARGV'
+  for a in "$@"; do printf ' %s' "$a"; done
+  printf '\n'
+} >>"${CURL_ARGV_LOG:-/dev/null}"
+exec /usr/bin/curl "$@"
+SHIM
+printf '#!/bin/sh\nexit 0\n' >"$work/bin/omarchy-shell"
+chmod +x "$work/bin/secret-tool" "$work/bin/curl" "$work/bin/omarchy-shell"
+
+export PATH="$work/bin:$PATH"
+export XDG_STATE_HOME="$work/state"
+export XDG_RUNTIME_DIR="$work/runtime"
+export HOME="$work/home"
+mkdir -p "$XDG_RUNTIME_DIR" "$HOME"
+export CURL_ARGV_LOG="$work/curl-argv"
+: >"$CURL_ARGV_LOG"
+
+cat >"$work/stub.py" <<'PY'
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+bootstrap = json.load(open(os.environ["STUB_BOOTSTRAP"]))
+integration = json.load(open(os.environ["STUB_INTEGRATION"]))
+mode = os.environ.get("STUB_MODE", "")
+log = open(os.environ["STUB_LOG"], "a")
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        log.write("GET " + self.path + "\n")
+        log.flush()
+        p = self.path.split("?")[0]
+        if p.endswith("/proxy/protect/integration/v1/sensors"):
+            if self.headers.get("X-API-KEY") != "test-key":
+                return self._json(401, {"error": "no key"})
+            return self._json(200, integration)
+        if p.endswith("/proxy/protect/api/bootstrap"):
+            if mode == "huge":
+                n = 10 * 1024 * 1024
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(n))
+                self.end_headers()
+                self.wfile.write(b"x" * n)
+                return
+            cookie = self.headers.get("Cookie") or ""
+            key = self.headers.get("X-API-KEY")
+            if "TOKEN=test-token" in cookie or (mode == "key-bootstrap" and key == "test-key"):
+                return self._json(200, bootstrap)
+            return self._json(401, {"error": "no session"})
+        self._json(404, {"error": "unknown"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length)
+        log.write("POST " + self.path + "\n")
+        if self.headers.get("Cookie"):
+            log.write("LOGIN_SENT_COOKIE\n")
+        log.write("LOGIN_BODY " + raw.decode("utf-8", "replace") + "\n")
+        log.flush()
+        p = self.path.split("?")[0]
+        if p.endswith("/api/auth/login"):
+            try:
+                body = json.loads(raw.decode())
+            except Exception:
+                return self._json(400, {"error": "bad json"})
+            if body.get("username") == "viewer" and body.get("password") == "test-password":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", "TOKEN=test-token; Path=/; HttpOnly")
+                data = b"{}"
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            return self._json(401, {"error": "bad login"})
+        self._json(404, {"error": "unknown"})
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_port, flush=True)
+srv.serve_forever()
+PY
+
+passed=0
+failed=0
+ok()   { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+fail() { printf '  FAIL  %s\n        %s\n' "$1" "$2"; failed=$(( failed + 1 )); }
+
+write_config() { # auth [username]
+  mkdir -p "$XDG_STATE_HOME/omarchy/unifi-air"
+  printf 'url=http://127.0.0.1:%s\ninsecure=0\nauth=%s\nusername=%s\n' \
+    "$port" "$1" "${2:-}" >"$XDG_STATE_HOME/omarchy/unifi-air/config"
+}
+
+start_stub() { # mode integration-fixture
+  export STUB_BOOTSTRAP="$TEST_DIR/fixtures/bootstrap.json"
+  export STUB_INTEGRATION="${2:-$TEST_DIR/fixtures/integration-no-aqi.json}"
+  export STUB_MODE="${1:-}"
+  export STUB_LOG="$work/requests"
+  : >"$STUB_LOG"
+  : >"$CURL_ARGV_LOG"
+  python3 "$work/stub.py" >"$work/port" 2>/dev/null &
+  stub_pid=$!
+  local _
+  for _ in $(seq 1 50); do
+    [[ -s $work/port ]] && break
+    sleep 0.1
+  done
+  port=$(cat "$work/port")
+}
+
+stop_stub() {
+  kill "$stub_pid" 2>/dev/null
+  wait "$stub_pid" 2>/dev/null
+  stub_pid=""
+  rm -f "$work/port"
+}
+
+assert_no_secrets_on_argv() {
+  if grep -Fq 'test-key' "$CURL_ARGV_LOG" || grep -Fq 'test-password' "$CURL_ARGV_LOG"; then
+    fail "secrets never appear on curl argv" "$(cat "$CURL_ARGV_LOG")"
+  elif grep -Fq 'ARGV --config' "$CURL_ARGV_LOG"; then
+    ok "secrets never appear on curl argv (curl --config -)"
+  else
+    fail "secrets never appear on curl argv" "curl was not invoked with --config: $(cat "$CURL_ARGV_LOG")"
+  fi
+}
+
+echo "unifi-air-fetch against a stub Protect console:"
+
+# Password session: login then bootstrap, AQI/CO2 from the private payload.
+export STUB_HAVE_KEY=0 STUB_HAVE_PASS=1
+start_stub ""
+write_config password viewer
+out=$("$PLUGIN_DIR/unifi-air-fetch")
+if jq -e '.error == null and .sensor.aqi.value == 2 and .sensor.co2.value == 998
+          and .sensor.name == "Protect Air Quality"
+          and (.controller.url | startswith("http://127.0.0.1:"))' <<<"$out" >/dev/null \
+   && grep -q 'POST /api/auth/login' "$work/requests" \
+   && ! grep -q LOGIN_SENT_COOKIE "$work/requests"; then
+  ok "password login reads AQI/CO2 from bootstrap"
+else
+  fail "password login reads AQI/CO2 from bootstrap" "$out
+$(cat "$work/requests" 2>/dev/null)"
+fi
+if grep -Fq '"rememberMe":false' "$work/requests"; then
+  ok "login posts rememberMe false"
+else
+  fail "login posts rememberMe false" "$(grep LOGIN_BODY "$work/requests")"
+fi
+assert_no_secrets_on_argv
+if compgen -G /tmp/unifi-air-login.body.* >/dev/null; then
+  fail "login body is not written to /tmp" "$(ls /tmp/unifi-air-login.body.*)"
+else
+  ok "login body is not written to /tmp"
+fi
+leftover=$(find "$XDG_STATE_HOME/omarchy/unifi-air" -maxdepth 1 \( -name 'body.*' -o -name 'err.*' -o -name 'auth.*' -o -name cookie \) -print)
+if [[ -z $leftover ]]; then ok "state dir is cleaned after a poll"
+else fail "state dir is cleaned after a poll" "$leftover"; fi
+stop_stub
+
+# Named sensor via argv, not a shell.
+export STUB_HAVE_KEY=0 STUB_HAVE_PASS=1
+start_stub ""
+write_config password viewer
+out=$("$PLUGIN_DIR/unifi-air-fetch" --sensor-name="Workshop Air")
+if jq -e '.sensor.name == "Workshop Air" and .sensor.aqi.value == 42
+          and .sensor.connected == false' <<<"$out" >/dev/null; then
+  ok "--sensor-name selects the named sensor"
+else
+  fail "--sensor-name selects the named sensor" "$out"
+fi
+stop_stub
+
+# Integration API with AQI: no password login.
+export STUB_HAVE_KEY=1 STUB_HAVE_PASS=0
+start_stub "" "$TEST_DIR/fixtures/integration.json"
+write_config apikey
+out=$("$PLUGIN_DIR/unifi-air-fetch")
+if jq -e '.sensor.aqi.value == 5 and .sensor.co2.value == 400' <<<"$out" >/dev/null \
+   && ! grep -q POST "$work/requests"; then
+  ok "integration API with AQI skips password login"
+else
+  fail "integration API with AQI skips password login" "$out
+$(cat "$work/requests" 2>/dev/null)"
+fi
+assert_no_secrets_on_argv
+stop_stub
+
+# Integration without AQI falls through to password bootstrap.
+export STUB_HAVE_KEY=1 STUB_HAVE_PASS=1
+start_stub "" "$TEST_DIR/fixtures/integration-no-aqi.json"
+write_config password viewer
+out=$("$PLUGIN_DIR/unifi-air-fetch")
+if jq -e '.sensor.aqi.value == 2' <<<"$out" >/dev/null \
+   && grep -q 'GET /proxy/protect/integration/v1/sensors' "$work/requests" \
+   && grep -q 'POST /api/auth/login' "$work/requests"; then
+  ok "incomplete integration payload falls through to session bootstrap"
+else
+  fail "incomplete integration payload falls through to session bootstrap" "$out
+$(cat "$work/requests" 2>/dev/null)"
+fi
+stop_stub
+
+# Oversized bootstrap must not be swallowed by the shell.
+export STUB_HAVE_KEY=0 STUB_HAVE_PASS=1
+start_stub huge
+write_config password viewer
+out=$(timeout 30 "$PLUGIN_DIR/unifi-air-fetch")
+if jq -e '.error | test("larger than")' <<<"$out" >/dev/null; then
+  ok "gives up on a bootstrap body over the size limit"
+else
+  fail "gives up on a bootstrap body over the size limit" "${out:0:300}"
+fi
+stop_stub
+
+# A stored URL that would break the curl config is refused, not spliced.
+export STUB_HAVE_KEY=0 STUB_HAVE_PASS=1
+mkdir -p "$XDG_STATE_HOME/omarchy/unifi-air" "$HOME"
+printf 'url=https://127.0.0.1:1"\noutput = "%s"\ninsecure=0\nauth=password\nusername=viewer\n' \
+  "$HOME/pwned" >"$XDG_STATE_HOME/omarchy/unifi-air/config"
+out=$("$PLUGIN_DIR/unifi-air-fetch")
+if jq -e '.needsLogin == true or (.error | test("not usable|Set up|login"))' <<<"$out" >/dev/null \
+   && [[ ! -e $HOME/pwned ]]; then
+  ok "refuses a stored URL that would break the curl config"
+else
+  fail "refuses a stored URL that would break the curl config" "$out"
+fi
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))
