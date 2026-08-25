@@ -1,0 +1,12 @@
+[
+  {
+    "id": "air-1",
+    "name": "Protect Air Quality",
+    "type": "UP-AirQuality",
+    "state": "CONNECTED",
+    "airQuality": {
+      "temperature": { "value": 23.9, "status": "GOOD" },
+      "humidity": { "value": 45, "status": "GOOD" }
+    }
+  }
+]

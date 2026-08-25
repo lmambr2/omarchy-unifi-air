@@ -1,0 +1,13 @@
+[
+  {
+    "id": "air-1",
+    "name": "Protect Air Quality",
+    "type": "UP-AirQuality",
+    "state": "CONNECTED",
+    "airQuality": {
+      "aqi": { "value": 5, "status": "GOOD" },
+      "co2": { "value": 400, "status": "GOOD" },
+      "temperature": { "value": 23.9, "status": "GOOD" }
+    }
+  }
+]

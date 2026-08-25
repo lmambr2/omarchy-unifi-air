@@ -1,0 +1,34 @@
+{
+  "sensors": [
+    {
+      "id": "air-1",
+      "name": "Protect Air Quality",
+      "type": "UP-AirQuality",
+      "isConnected": true,
+      "airQuality": {
+        "aqi": { "value": 2, "status": "GOOD" },
+        "co2": { "value": 998, "status": "GOOD" },
+        "humidity": { "value": 45, "status": "GOOD" },
+        "temperature": { "value": 23.9, "status": "GOOD" },
+        "pm1p0": { "value": 0.4, "status": "GOOD" },
+        "pm2p5": { "value": 1.2, "status": "GOOD" },
+        "pm4p0": { "value": 1.5, "status": "GOOD" },
+        "pm10p0": { "value": 2.0, "status": "GOOD" },
+        "voc": { "value": 80, "status": "GOOD" },
+        "tvoc": { "value": 90, "status": "GOOD" },
+        "vape": { "value": 0, "status": "GOOD" }
+      }
+    },
+    {
+      "id": "air-2",
+      "name": "Workshop Air",
+      "type": "UP-AirQuality",
+      "isConnected": false,
+      "airQuality": {
+        "aqi": { "value": 42, "status": "GOOD" },
+        "co2": { "value": 610, "status": "GOOD" },
+        "temperature": { "value": 19.0, "status": "GOOD" }
+      }
+    }
+  ]
+}
