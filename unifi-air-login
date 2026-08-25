@@ -1,0 +1,173 @@
+#!/bin/bash
+# Configure Protect credentials for the UniFi Air widget.
+#
+# Usage: unifi-air-login            interactive setup
+#        unifi-air-login --status   show what is configured (never secrets)
+#        unifi-air-login --forget   remove stored credentials
+
+set -uo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+
+# shellcheck source=unifi-air-common.sh
+source "$SCRIPT_DIR/unifi-air-common.sh" || {
+  echo "unifi-air-common.sh is missing from the plugin folder" >&2
+  exit 1
+}
+
+for cmd in curl jq secret-tool; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "$cmd is not installed" >&2; exit 1; }
+done
+
+nudge() {
+  command -v omarchy-shell >/dev/null 2>&1 || return 0
+  omarchy-shell -q "$UNIFI_AIR_PLUGIN_ID" refresh >/dev/null 2>&1 || true
+}
+
+show_status() {
+  if unifi_air_load_config; then
+    echo "Controller: $UNIFI_AIR_URL"
+    echo "Auth:       $UNIFI_AIR_AUTH${UNIFI_AIR_USERNAME:+ ($UNIFI_AIR_USERNAME)}"
+    echo "TLS:        $([[ $UNIFI_AIR_INSECURE == 1 ]] && echo 'self-signed allowed' || echo 'verified')"
+  else
+    echo "Controller: not configured"
+  fi
+  if unifi_air_have_api_key; then echo "API key:    stored in keyring"
+  else echo "API key:    none"; fi
+  if unifi_air_have_password; then echo "Password:   stored in keyring"
+  else echo "Password:   none"; fi
+}
+
+case "${1:-}" in
+  --status) show_status; exit 0 ;;
+  --forget)
+    unifi_air_load_config || true
+    unifi_air_clear
+    echo "Removed Protect credentials."
+    nudge
+    exit 0 ;;
+  "") ;;
+  *) echo "usage: unifi-air-login [--status|--forget]" >&2; exit 2 ;;
+esac
+
+echo "UniFi Air — Protect login"
+echo
+echo "The UP-AirQuality sensor lives in UniFi Protect on your UniFi OS console"
+echo "(Dream Machine, Dream Router, Cloud Gateway, UNVR, and similar)."
+echo "A local UniFi OS user with Protect view access is the reliable path."
+echo "Create one under Settings → Admins & Users if you do not want to use"
+echo "your owner account. Cloud-only UI.com logins will not work."
+echo
+
+configured=0
+unifi_air_load_config && configured=1
+
+default_gateway=$(ip -4 route show default 2>/dev/null | awk '/^default via/ { print $3; exit }')
+default_url="${UNIFI_AIR_URL:-https://${default_gateway:-192.168.1.1}}"
+read -r -e -p "Controller URL [$default_url]: " url
+url="${url:-$default_url}"
+url="$(unifi_air_normalize_url "$url")" || {
+  echo "That does not look like a console address (https://host or https://host:port)." >&2
+  exit 1
+}
+
+if [[ $url == http://* ]]; then
+  read -r -p "Use HTTP without TLS? Only do this on a trusted network. [y/N]: " answer
+  if [[ ! ${answer:-} =~ ^[Yy] ]]; then
+    url="$(unifi_air_normalize_url "https://${url#http://}")" || exit 1
+    echo "Using $url"
+  fi
+fi
+
+if (( configured )); then
+  default_insecure=$([[ $UNIFI_AIR_INSECURE == 1 ]] && echo Y || echo N)
+else
+  if unifi_air_host_is_lan "$(unifi_air_host_from_url "$url")"; then
+    default_insecure=Y
+  else
+    default_insecure=N
+  fi
+fi
+yn=$([[ $default_insecure == Y ]] && echo "Y/n" || echo "y/N")
+read -r -p "Allow a self-signed certificate (most consoles have one)? [$yn]: " answer
+answer="${answer:-$default_insecure}"
+insecure=$([[ $answer =~ ^[Yy] ]] && echo 1 || echo 0)
+
+echo
+echo "The Network Integration API key can see the sensor exists, but Protect"
+echo "does not currently expose AQI/CO2 on that API — those readings are on"
+echo "the private bootstrap the Protect UI uses."
+echo
+echo "1) Local username + password  (required for AQI/CO2)"
+echo "2) API key                    (will not show AQI on current Protect)"
+read -r -p "Choose [1]: " method
+method="${method:-1}"
+
+UNIFI_AIR_URL="$url"
+UNIFI_AIR_INSECURE="$insecure"
+
+if [[ $method == 2 ]]; then
+  echo
+  echo "Paste the Protect API key (Ctrl+Shift+V), or copy it and press Enter for clipboard."
+  printf 'Protect API key: '
+  IFS= read -r key || true
+  key="${key//$'\r'/}"
+  key="${key//[$' \t\n']/}"
+  if [[ $key =~ ^cccccc ]]; then
+    echo "That was a YubiKey OTP, not the UniFi API key. Copy the key from the console." >&2
+    key=""
+  fi
+  if [[ -z $key ]]; then
+    key=$(wl-paste --no-newline 2>/dev/null || true)
+    key="${key//$'\r'/}"
+    key="${key//[$' \t\n']/}"
+    if [[ $key =~ ^cccccc ]]; then
+      echo "Clipboard is a YubiKey OTP. Copy the UniFi API key instead." >&2
+      key=""
+    fi
+    [[ -n $key ]] && echo "(clipboard, ${#key} characters)"
+  fi
+  [[ -n $key ]] || { echo "An API key is required." >&2; exit 1; }
+  unifi_air_config_safe "$key" || { echo "That key contains characters that cannot be sent safely." >&2; exit 1; }
+  printf '%s' "$key" | unifi_air_store_api_key || { echo "Could not store the key." >&2; exit 1; }
+  unset key
+  unifi_air_save_config "$url" "$insecure" apikey "" || { echo "Could not save the configuration." >&2; exit 1; }
+else
+  default_user="${UNIFI_AIR_USERNAME:-}"
+  read -r -e -p "Local username${default_user:+ [$default_user]}: " user
+  user="${user:-$default_user}"
+  [[ -n $user ]] || { echo "A username is required." >&2; exit 1; }
+  if [[ $user == *[$'\n\r=']* || ${#user} -gt 128 ]]; then
+    echo "That username is not usable." >&2
+    exit 1
+  fi
+  echo "Paste is OK. Or copy the password and press Enter to use the clipboard."
+  read -r -s -p "Password: " pass
+  echo
+  pass="${pass//$'\r'/}"
+  if [[ -z $pass ]]; then
+    pass=$(wl-paste --no-newline 2>/dev/null || true)
+    pass="${pass//$'\r'/}"
+    [[ -n $pass ]] && echo "(clipboard, ${#pass} characters)"
+  fi
+  [[ -n $pass ]] || { echo "A password is required." >&2; exit 1; }
+  printf '%s' "$pass" | unifi_air_store_password "$user" || { echo "Could not store the password." >&2; exit 1; }
+  unset pass
+  unifi_air_save_config "$url" "$insecure" password "$user" || { echo "Could not save the configuration." >&2; exit 1; }
+fi
+
+echo "Checking Protect…"
+out="$("$SCRIPT_DIR/unifi-air-fetch")"
+if echo "$out" | jq -e '.error' >/dev/null 2>&1; then
+  echo "Failed: $(echo "$out" | jq -r '.error')" >&2
+  exit 1
+fi
+echo "Signed in. Sensor: $(echo "$out" | jq -r '.sensor.name')"
+echo "$out" | jq -r '
+  "AQI \(.sensor.aqi.value // "?")  CO2 \(.sensor.co2.value // "?") ppm  "
+  + ((.sensor.temperature.value // null)
+     | if . == null then "?°C"
+       else ((. * 9 / 5) + 32 | floor | tostring) + "°F" end)'
+nudge
