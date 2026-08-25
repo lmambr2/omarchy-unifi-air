@@ -1,0 +1,118 @@
+#!/bin/bash
+# Fetch UP-AirQuality readings from UniFi Protect. Always exits 0 with JSON.
+#
+# Usage: unifi-air-fetch [--sensor-name=<name>]
+#
+# The API key and password are read from the keyring and never reach argv.
+# Secrets are handed to curl as a config on stdin, or as a JSON file for login.
+
+set -uo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly EXTRACT="$SCRIPT_DIR/extract.jq"
+
+# shellcheck source=unifi-air-common.sh
+source "$SCRIPT_DIR/unifi-air-common.sh" || {
+  echo '{"error":"plugin files missing"}'
+  exit 0
+}
+
+unifi_air_require_commands
+[[ -r $EXTRACT ]] || die "extract.jq is missing from the plugin folder"
+
+UNIFI_AIR_SENSOR_NAME="${UNIFI_AIR_SENSOR_NAME:-}"
+for arg in "$@"; do
+  case "$arg" in
+    --sensor-name=*) UNIFI_AIR_SENSOR_NAME="${arg#--sensor-name=}" ;;
+    *) die "unifi-air-fetch takes only --sensor-name=<name>" ;;
+  esac
+done
+if [[ $UNIFI_AIR_SENSOR_NAME == *[$'\n\r']* || ${#UNIFI_AIR_SENSOR_NAME} -gt 256 ]]; then
+  die "Sensor name is not usable"
+fi
+
+cleanup() {
+  rm -f "$UNIFI_AIR_COOKIE_FILE"
+  rm -f "$UNIFI_AIR_STATE_DIR"/body.* "$UNIFI_AIR_STATE_DIR"/err.* "$UNIFI_AIR_STATE_DIR"/auth.*
+}
+trap cleanup EXIT
+
+unifi_air_load_config || die_needs_login "No UniFi Protect login. Click Set up."
+
+extract_sensors() { # source
+  jq -c --arg want "${UNIFI_AIR_SENSOR_NAME:-}" --arg source "$1" -f "$EXTRACT"
+}
+
+emit_sensors() { # sensors-json
+  local sensors="$1"
+  [[ $sensors == \[* ]] || return 1
+  if [[ $sensors == "[]" ]]; then
+    die "Protect answered but no UP-AirQuality sensor is adopted."
+  fi
+  jq -cn --argjson sensors "$sensors" --arg url "$UNIFI_AIR_URL" \
+    '{sensor: $sensors[0], sensors: $sensors, controller: {url: $url}}'
+  exit 0
+}
+
+# Official Protect Integration API (key auth). Finds UP-AirQuality, but
+# Protect 7.2 still omits AQI/CO2 here — those live on private /api/bootstrap.
+fetch_integration_sensors() {
+  local key="$1"
+  local sensors
+  unifi_air_http_get "$UNIFI_AIR_URL/proxy/protect/integration/v1/sensors" "$key"
+  [[ $UNIFI_AIR_HTTP_CODE == 200 ]] || return 1
+  sensors=$(extract_sensors integration <<<"$UNIFI_AIR_HTTP_BODY") || return 1
+  [[ $sensors != "[]" && -n $sensors ]] || return 1
+  if jq -e '.[0].aqi.value == null and .[0].co2.value == null' <<<"$sensors" >/dev/null; then
+    return 1
+  fi
+  emit_sensors "$sensors"
+}
+
+fetch_bootstrap_apikey() {
+  local key="$1"
+  local sensors
+  unifi_air_http_get "$UNIFI_AIR_URL/proxy/protect/api/bootstrap" "$key"
+  [[ $UNIFI_AIR_HTTP_CODE == 200 ]] || return 1
+  sensors=$(extract_sensors bootstrap <<<"$UNIFI_AIR_HTTP_BODY") || return 1
+  emit_sensors "$sensors"
+}
+
+fetch_bootstrap_session() {
+  local pass="$1"
+  local sensors reason
+  unifi_air_http_login "$UNIFI_AIR_USERNAME" "$pass"
+  case "$UNIFI_AIR_HTTP_CODE" in
+    200) ;;
+    401|403) return 1 ;;
+    *)
+      if reason=$(unifi_air_describe_http_failure); then die "$reason"; fi
+      return 1
+      ;;
+  esac
+  unifi_air_http_get "$UNIFI_AIR_URL/proxy/protect/api/bootstrap" "" "$UNIFI_AIR_COOKIE_FILE"
+  if reason=$(unifi_air_describe_http_failure); then
+    die "$reason"
+  fi
+  sensors=$(extract_sensors bootstrap <<<"$UNIFI_AIR_HTTP_BODY") || return 1
+  emit_sensors "$sensors"
+}
+
+key="$(unifi_air_api_key || true)"
+if [[ -n $key ]]; then
+  fetch_integration_sensors "$key" && exit 0
+  fetch_bootstrap_apikey "$key" && exit 0
+fi
+unset key
+
+if [[ ${UNIFI_AIR_AUTH} == password || -n $UNIFI_AIR_USERNAME ]]; then
+  pass="$(unifi_air_password || true)"
+  if [[ -n $pass && -n $UNIFI_AIR_USERNAME ]]; then
+    fetch_bootstrap_session "$pass" && exit 0
+  fi
+  unset pass
+fi
+
+die_needs_login "AQI/CO2 need a local UniFi OS user (Protect view), not the Network API key. Click Set up, choose option 1."

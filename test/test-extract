@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# extract.jq against fixtures — no network, no credentials.
+
+set -uo pipefail
+
+TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly TEST_DIR
+PLUGIN_DIR="$(dirname -- "$TEST_DIR")"
+readonly PLUGIN_DIR
+readonly EXTRACT="$PLUGIN_DIR/extract.jq"
+readonly FIX="$TEST_DIR/fixtures"
+
+passed=0
+failed=0
+ok()   { printf '  ok    %s\n' "$1"; passed=$(( passed + 1 )); }
+fail() { printf '  FAIL  %s\n        %s\n' "$1" "$2"; failed=$(( failed + 1 )); }
+
+extract() { # source want file
+  jq -c --arg source "$1" --arg want "$2" -f "$EXTRACT" "$3"
+}
+
+echo "extract.jq"
+
+out=$(extract bootstrap "" "$FIX/bootstrap.json")
+if jq -e 'length == 2 and .[0].aqi.value == 2 and .[0].co2.value == 998
+          and .[0].temperature.value == 23.9 and .[0].connected == true
+          and .[1].name == "Workshop Air" and .[1].connected == false' <<<"$out" >/dev/null; then
+  ok "bootstrap maps both air sensors, including disconnected"
+else
+  fail "bootstrap maps both air sensors, including disconnected" "$out"
+fi
+
+out=$(extract bootstrap "Workshop Air" "$FIX/bootstrap.json")
+if jq -e 'length == 1 and .[0].id == "air-2" and .[0].aqi.value == 42' <<<"$out" >/dev/null; then
+  ok "bootstrap --sensor-name picks by name"
+else
+  fail "bootstrap --sensor-name picks by name" "$out"
+fi
+
+out=$(extract integration "" "$FIX/integration.json")
+if jq -e 'length == 1 and .[0].aqi.value == 5 and .[0].co2.value == 400' <<<"$out" >/dev/null; then
+  ok "integration payload with AQI/CO2"
+else
+  fail "integration payload with AQI/CO2" "$out"
+fi
+
+out=$(extract integration "" "$FIX/integration-no-aqi.json")
+if jq -e 'length == 1 and .[0].aqi.value == null and .[0].co2.value == null
+          and .[0].temperature.value == 23.9' <<<"$out" >/dev/null; then
+  ok "integration payload without AQI still lists the sensor"
+else
+  fail "integration payload without AQI still lists the sensor" "$out"
+fi
+
+echo
+printf '%d passed, %d failed\n' "$passed" "$failed"
+(( failed == 0 ))
